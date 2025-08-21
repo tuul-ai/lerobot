@@ -408,6 +408,31 @@ def hw_to_dataset_features(
         }
 
     if joint_fts and prefix == "observation":
+        # Check if this is a bimanual robot by looking for left_/right_ motor prefixes
+        is_bimanual_robot = any(name.startswith(('left_', 'right_')) for name in joint_fts.keys())
+        
+        # Add bimanual affordance features for bimanual robots
+        if is_bimanual_robot:
+            bimanual_states = [
+                # Task context (3 features)
+                'task_type', 'coordination_required', 'primary_arm',
+                
+                # Red arm targets (8 features)
+                'red_target_y1_top', 'red_target_x1_top', 'red_target_y2_top', 'red_target_x2_top',
+                'red_target_y1_front', 'red_target_x1_front', 'red_target_y2_front', 'red_target_x2_front',
+                
+                # White arm targets (8 features)
+                'white_target_y1_top', 'white_target_x1_top', 'white_target_y2_top', 'white_target_x2_top',
+                'white_target_y1_front', 'white_target_x1_front', 'white_target_y2_front', 'white_target_x2_front',
+                
+                # Action encodings (6 features)
+                'red_action_pick', 'red_action_hold', 'red_action_place',
+                'white_action_pick', 'white_action_pull', 'white_action_place'
+            ]
+            
+            # Add bimanual features to joint features
+            joint_fts = {**joint_fts, **{name: float for name in bimanual_states}}
+        
         features[f"{prefix}.state"] = {
             "dtype": "float32",
             "shape": (len(joint_fts),),

@@ -143,6 +143,7 @@ def init_keyboard_listener():
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    events["select_new_bbox"] = False
 
     if is_headless():
         logging.warning(
@@ -167,6 +168,9 @@ def init_keyboard_listener():
                 print("Escape key pressed. Stopping data recording...")
                 events["stop_recording"] = True
                 events["exit_early"] = True
+            elif key == keyboard.Key.space:
+                print("Space key pressed. Selecting new bounding boxes...")
+                events["select_new_bbox"] = True
         except Exception as e:
             print(f"Error handling key press: {e}")
 

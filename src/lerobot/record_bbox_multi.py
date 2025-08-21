@@ -33,28 +33,6 @@ python -m lerobot.record \
     # <- Policy optional if you want to record with a policy \
     # --policy.path=${HF_USER}/my_policy \
 ```
-
-Example recording with bimanual so100:
-```shell
-python -m lerobot.record \
-  --robot.type=bi_so100_follower \
-  --robot.left_arm_port=/dev/tty.usbmodem5A460851411 \
-  --robot.right_arm_port=/dev/tty.usbmodem5A460812391 \
-  --robot.id=bimanual_follower \
-  --robot.cameras='{
-    left: {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30},
-    top: {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30},
-    right: {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}
-  }' \
-  --teleop.type=bi_so100_leader \
-  --teleop.left_arm_port=/dev/tty.usbmodem5A460828611 \
-  --teleop.right_arm_port=/dev/tty.usbmodem5A460826981 \
-  --teleop.id=bimanual_leader \
-  --display_data=true \
-  --dataset.repo_id=${HF_USER}/bimanual-so100-handover-cube \
-  --dataset.num_episodes=25 \
-  --dataset.single_task="Grab and handover the red cube to the other arm"
-```
 """
 
 import logging
@@ -63,23 +41,23 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from pprint import pformat
 
+import numpy as np
+import rerun as rr
+import torch
+
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
-from lerobot.configs import parser
-from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
-from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
-    bi_so100_follower,
     make_robot_from_config,
     so100_follower,
     so101_follower,
@@ -87,12 +65,10 @@ from lerobot.robots import (  # noqa: F401
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
-    bi_so100_leader,
-    make_teleoperator_from_config,
-    so100_leader,
+    so100_leader, 
     so101_leader,
+    make_teleoperator_from_config,
 )
-from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -106,7 +82,16 @@ from lerobot.utils.utils import (
     init_logging,
     log_say,
 )
-from lerobot.utils.visualization_utils import _init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import _init_rerun
+from lerobot.configs import parser
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.gemini_perception import (
+    get_target_bbox,
+    get_random_targets,
+    plot_bbox,
+    get_target_bbox_multi_view,
+    get_random_targets_multi_view,
+)
 
 
 @dataclass
@@ -142,9 +127,6 @@ class DatasetRecordConfig:
     # Too many threads might cause unstable teleoperation fps due to main thread being blocked.
     # Not enough threads might cause low camera fps.
     num_image_writer_threads_per_camera: int = 4
-    # Number of episodes to record before batch encoding videos
-    # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
-    video_encoding_batch_size: int = 1
 
     def __post_init__(self):
         if self.single_task is None:
@@ -182,14 +164,13 @@ class RecordConfig:
         """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
         return ["policy"]
 
-
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
     events: dict,
     fps: int,
     dataset: LeRobotDataset | None = None,
-    teleop: Teleoperator | list[Teleoperator] | None = None,
+    teleop: Teleoperator | None = None,
     policy: PreTrainedPolicy | None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
@@ -198,41 +179,80 @@ def record_loop(
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
-    teleop_arm = teleop_keyboard = None
-    if isinstance(teleop, list):
-        teleop_keyboard = next((t for t in teleop if isinstance(t, KeyboardTeleop)), None)
-        teleop_arm = next(
-            (
-                t
-                for t in teleop
-                if isinstance(t, (so100_leader.SO100Leader, so101_leader.SO101Leader, koch_leader.KochLeader))
-            ),
-            None,
-        )
-
-        if not (teleop_arm and teleop_keyboard and len(teleop) == 2 and robot.name == "lekiwi_client"):
-            raise ValueError(
-                "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
-            )
-
     # if policy is given it needs cleaning up
     if policy is not None:
         policy.reset()
 
     timestamp = 0
     start_episode_t = time.perf_counter()
+    
+    observation = robot.get_observation()
+    print(observation.keys())
+
+    # Multi-view perception using both top and front cameras
+    # Assuming the robot has both 'top' and 'front' cameras
+    # Change the camera names if needed
+    (pick_top, pick_front, place_top, place_front, 
+    norm_pick_top, norm_pick_front, norm_place_top, norm_place_front,
+    pick_labels, place_labels) = get_target_bbox_multi_view(
+                observation["top"], 
+                observation["front"]
+            )
+                
+    (pick_t_top, pick_t_front, place_t_top, place_t_front,
+    norm_pick_t_top, norm_pick_t_front, norm_place_t_top, norm_place_t_front,
+    pick_top, pick_front, norm_pick_top, norm_pick_front,
+    pick_target_label, place_target_label, pick_labels) = get_random_targets_multi_view(
+            pick_top, pick_front, place_top, place_front, 
+            norm_pick_top, norm_pick_front, norm_place_top, norm_place_front,
+            pick_labels, place_labels
+        )
+                
+    single_task = f"Grasp {pick_target_label} and put it in {place_target_label}"
+                
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
         if events["exit_early"]:
             events["exit_early"] = False
             break
+        if events["select_new_bbox"]:
+            events["select_new_bbox"] = False
 
+            (pick_t_top, pick_t_front, place_t_top, place_t_front,
+            norm_pick_t_top, norm_pick_t_front, norm_place_t_top, norm_place_t_front,
+            pick_top, pick_front, norm_pick_top, norm_pick_front,
+            pick_target_label, place_target_label, pick_labels) = get_random_targets_multi_view(
+                pick_top, pick_front, place_top, place_front, 
+                norm_pick_top, norm_pick_front, norm_place_top, norm_place_front,
+                pick_labels, place_labels
+            )
+            single_task = f"Grasp {pick_target_label} and put it in {place_target_label}"
+            
+        
         observation = robot.get_observation()
+        observation.update({
+            'pick_y1_top': norm_pick_t_top[0],
+            'pick_x1_top': norm_pick_t_top[1], 
+            'pick_y2_top': norm_pick_t_top[2],
+            'pick_x2_top': norm_pick_t_top[3],
+            'place_y1_top': norm_place_t_top[0],
+            'place_x1_top': norm_place_t_top[1],
+            'place_y2_top': norm_place_t_top[2],
+            'place_x2_top': norm_place_t_top[3],
+            'pick_y1_front': norm_pick_t_front[0],
+            'pick_x1_front': norm_pick_t_front[1], 
+            'pick_y2_front': norm_pick_t_front[2],
+            'pick_x2_front': norm_pick_t_front[3],
+            'place_y1_front': norm_place_t_front[0],
+            'place_x1_front': norm_place_t_front[1],
+            'place_y2_front': norm_place_t_front[2],
+            'place_x2_front': norm_place_t_front[3],
+        })
 
         if policy is not None or dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, observation, prefix="observation")
-
+    
         if policy is not None:
             action_values = predict_action(
                 observation_frame,
@@ -243,17 +263,8 @@ def record_loop(
                 robot_type=robot.robot_type,
             )
             action = {key: action_values[i].item() for i, key in enumerate(robot.action_features)}
-        elif policy is None and isinstance(teleop, Teleoperator):
+        elif policy is None and teleop is not None:
             action = teleop.get_action()
-        elif policy is None and isinstance(teleop, list):
-            # TODO(pepijn, steven): clean the record loop for use of multiple robots (possibly with pipeline)
-            arm_action = teleop_arm.get_action()
-            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
-
-            keyboard_action = teleop_keyboard.get_action()
-            base_action = robot._from_keyboard_to_base_action(keyboard_action)
-
-            action = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
         else:
             logging.info(
                 "No policy or teleoperator provided, skipping action generation."
@@ -272,7 +283,19 @@ def record_loop(
             dataset.add_frame(frame, task=single_task)
 
         if display_data:
-            log_rerun_data(observation, action)
+            for obs, val in observation.items():
+                if isinstance(val, float):
+                    rr.log(f"observation.{obs}", rr.Scalar(val))
+                elif isinstance(val, np.ndarray):
+                    if "front" in obs:
+                        val = np.array(plot_bbox(observation["front"], pick_bbox=pick_t_front, place_bbox=place_t_front))
+                    else:
+                        val = np.array(plot_bbox(observation["top"], pick_bbox=pick_t_top, place_bbox=place_t_top))
+                    #val = np.array(plot_bbox(observation["front"], pick_bbox=pick_t, place_bbox=place_t))
+                    rr.log(f"observation.{obs}", rr.Image(val), static=True)
+            for act, val in action.items():
+                if isinstance(val, float):
+                    rr.log(f"action.{act}", rr.Scalar(val))
 
         dt_s = time.perf_counter() - start_loop_t
         busy_wait(1 / fps - dt_s)
@@ -298,7 +321,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
             root=cfg.dataset.root,
-            batch_encoding_size=cfg.dataset.video_encoding_batch_size,
         )
 
         if hasattr(robot, "cameras") and len(robot.cameras) > 0:
@@ -319,7 +341,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             use_videos=cfg.dataset.video,
             image_writer_processes=cfg.dataset.num_image_writer_processes,
             image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
-            batch_encoding_size=cfg.dataset.video_encoding_batch_size,
         )
 
     # Load pretrained policy
@@ -330,54 +351,53 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         teleop.connect()
 
     listener, events = init_keyboard_listener()
+    time.sleep(3)
+    for recorded_episodes in range(cfg.dataset.num_episodes):
+        log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+        record_loop(
+            robot=robot,
+            events=events,
+            fps=cfg.dataset.fps,
+            teleop=teleop,
+            policy=policy,
+            dataset=dataset,
+            control_time_s=cfg.dataset.episode_time_s,
+            single_task=cfg.dataset.single_task,
+            display_data=cfg.display_data,
+        )
 
-    with VideoEncodingManager(dataset):
-        recorded_episodes = 0
-        while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-            log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+        # Execute a few seconds without recording to give time to manually reset the environment
+        # Skip reset for the last episode to be recorded
+        if not events["stop_recording"] and (
+            (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+        ):
+            log_say("Reset the environment", cfg.play_sounds)
             record_loop(
                 robot=robot,
                 events=events,
                 fps=cfg.dataset.fps,
                 teleop=teleop,
-                policy=policy,
-                dataset=dataset,
-                control_time_s=cfg.dataset.episode_time_s,
+                control_time_s=cfg.dataset.reset_time_s,
                 single_task=cfg.dataset.single_task,
                 display_data=cfg.display_data,
             )
 
-            # Execute a few seconds without recording to give time to manually reset the environment
-            # Skip reset for the last episode to be recorded
-            if not events["stop_recording"] and (
-                (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-            ):
-                log_say("Reset the environment", cfg.play_sounds)
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=cfg.dataset.fps,
-                    teleop=teleop,
-                    control_time_s=cfg.dataset.reset_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                )
+        if events["rerecord_episode"]:
+            log_say("Re-record episode", cfg.play_sounds)
+            events["rerecord_episode"] = False
+            events["exit_early"] = False
+            dataset.clear_episode_buffer()
+            continue
 
-            if events["rerecord_episode"]:
-                log_say("Re-record episode", cfg.play_sounds)
-                events["rerecord_episode"] = False
-                events["exit_early"] = False
-                dataset.clear_episode_buffer()
-                continue
+        dataset.save_episode()
 
-            dataset.save_episode()
-            recorded_episodes += 1
+        if events["stop_recording"]:
+            break
 
     log_say("Stop recording", cfg.play_sounds, blocking=True)
 
     robot.disconnect()
-    if teleop is not None:
-        teleop.disconnect()
+    teleop.disconnect()
 
     if not is_headless() and listener is not None:
         listener.stop()

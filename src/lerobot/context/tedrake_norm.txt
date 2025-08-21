@@ -1,0 +1,458 @@
+# Robot Action Normalization Technical Summary and Implementation Guide
+
+## Background Problem
+Russ Tedrake from MIT/TRI presented research showing that **data normalization had 40 times more impact than architectural changes** in robotic manipulation. Specifically, **per-timestep action normalization** provided 20+ percentage point improvements in success rates.
+
+## The Core Discovery
+**Standard approach (suboptimal):**
+- Use the same statistical normalizer (mean/std) for all timesteps in action trajectories
+- Treat action at timestep 1 and timestep 50 with identical normalization statistics
+
+**Improved approach (20+ point performance gain):**
+- Compute separate normalization statistics for each timestep in the trajectory
+- Recognize that early timesteps (small movements) and later timesteps (large movements) have fundamentally different statistical distributions
+
+## Technical Details
+
+### When Normalization Happens
+- **Data preprocessing phase**: After collection, before training
+- Statistics computed once from training data and frozen
+- Same statistics used for denormalization during inference
+
+### Implementation Requirements
+```python
+# Standard approach (current bad approach)
+actions = np.array(all_demonstrations)  # [N_demos, T_steps, action_dim]
+actions_flat = actions.reshape(-1, action_dim)
+mean = np.mean(actions_flat, axis=0)
+std = np.std(actions_flat, axis=0)
+normalized = (actions - mean) / std
+
+# Required per-timestep approach  
+actions = np.array(all_demonstrations)  # [N_demos, T_steps, action_dim]
+T_steps = actions.shape[1]
+
+means = np.zeros((T_steps, action_dim))
+stds = np.zeros((T_steps, action_dim))
+
+for t in range(T_steps):
+    timestep_actions = actions[:, t, :]  # [N_demos, action_dim]
+    means[t] = np.mean(timestep_actions, axis=0)
+    stds[t] = np.std(timestep_actions, axis=0)
+
+# Apply per-timestep normalization
+normalized_actions = np.zeros_like(actions)
+for t in range(T_steps):
+    normalized_actions[:, t, :] = (actions[:, t, :] - means[t]) / stds[t]
+```
+
+## LeRobot Analysis
+
+### Current LeRobot Implementation
+Looking at `normalize.py`, LeRobot does **NOT** implement per-timestep normalization. It uses global statistics across all timesteps.
+
+### SmolVLA Specific Analysis
+- SmolVLA already handles multi-timestep action sequences (chunk_size=50)
+- Uses standard LeRobot normalization (global statistics)
+- **No changes needed to policy or training scripts** - only normalization system
+
+### Why 50 Steps Is Better Than 16
+Longer chunks benefit more from per-timestep normalization because:
+1. Greater statistical divergence between early/late timesteps
+2. Step 1: ~2cm movement, Step 50: ~150cm+ movement
+3. More timesteps = more opportunities for statistical mismatch
+4. Expected improvement might be larger than Tedrake's 20+ points
+
+## Implementation Strategy: Drop-in Replacement
+
+Create `normalize_tedrake.py` with exact same interface as original `normalize.py`:
+
+### 1. Enhanced Normalization Module
+
+```python
+#!/usr/bin/env python
+# lerobot/common/policies/normalize_tedrake.py
+
+import torch
+from torch import Tensor, nn
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.common.policies.normalize import (
+    create_stats_buffers as _original_create_stats_buffers,
+    _no_stats_error_str,
+)
+
+def create_stats_buffers(
+    features: dict[str, PolicyFeature],
+    norm_map: dict[str, NormalizationMode], 
+    stats: dict[str, dict[str, Tensor]] | None = None,
+    per_timestep_action_norm: bool = True,
+) -> dict[str, dict[str, nn.ParameterDict]]:
+    """Enhanced version with per-timestep action normalization"""
+    
+    # For non-action features, use original implementation
+    non_action_features = {k: v for k, v in features.items() 
+                          if v.type != FeatureType.ACTION}
+    non_action_stats = {k: v for k, v in (stats or {}).items() 
+                       if k in non_action_features}
+    
+    buffers = _original_create_stats_buffers(non_action_features, norm_map, non_action_stats)
+    
+    # Handle action features with per-timestep normalization
+    for key, ft in features.items():
+        if ft.type != FeatureType.ACTION:
+            continue
+            
+        norm_mode = norm_map.get(ft.type, NormalizationMode.IDENTITY)
+        if norm_mode == NormalizationMode.IDENTITY:
+            continue
+            
+        if per_timestep_action_norm and stats and key in stats:
+            # Detect if we have per-timestep stats
+            mean_shape = stats[key]["mean"].shape
+            expected_shape = tuple(ft.shape)
+            
+            if len(mean_shape) > len(expected_shape):
+                # We have per-timestep stats: [timesteps, action_dim]
+                shape = mean_shape
+            else:
+                # Fall back to global stats
+                shape = expected_shape
+        else:
+            shape = tuple(ft.shape)
+            
+        # Create buffers (same logic as original)
+        buffer = {}
+        if norm_mode == NormalizationMode.MEAN_STD:
+            mean = torch.ones(shape, dtype=torch.float32) * torch.inf
+            std = torch.ones(shape, dtype=torch.float32) * torch.inf
+            buffer = nn.ParameterDict({
+                "mean": nn.Parameter(mean, requires_grad=False),
+                "std": nn.Parameter(std, requires_grad=False),
+            })
+            
+        # Load stats if provided
+        if stats and key in stats:
+            if norm_mode == NormalizationMode.MEAN_STD:
+                buffer["mean"].data = torch.from_numpy(stats[key]["mean"]).to(dtype=torch.float32)
+                buffer["std"].data = torch.from_numpy(stats[key]["std"]).to(dtype=torch.float32)
+                
+        buffers[key] = buffer
+    
+    return buffers
+
+class Normalize(nn.Module):
+    """Drop-in replacement with per-timestep action normalization"""
+    
+    def __init__(self, features, norm_map, stats=None):
+        super().__init__()
+        self.features = features
+        self.norm_map = norm_map
+        self.stats = stats
+        
+        stats_buffers = create_stats_buffers(features, norm_map, stats, 
+                                           per_timestep_action_norm=True)
+        for key, buffer in stats_buffers.items():
+            setattr(self, "buffer_" + key.replace(".", "_"), buffer)
+    
+    @torch.no_grad
+    def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        batch = dict(batch)
+        
+        for key, ft in self.features.items():
+            if key not in batch:
+                continue
+                
+            norm_mode = self.norm_map.get(ft.type, NormalizationMode.IDENTITY)
+            if norm_mode == NormalizationMode.IDENTITY:
+                continue
+                
+            buffer = getattr(self, "buffer_" + key.replace(".", "_"))
+            
+            if norm_mode == NormalizationMode.MEAN_STD:
+                mean = buffer["mean"]
+                std = buffer["std"]
+                
+                # NEW: Per-timestep normalization for actions
+                if (ft.type == FeatureType.ACTION and 
+                    len(mean.shape) > len(ft.shape) and
+                    batch[key].ndim == 3):  # [batch, timesteps, action_dim]
+                    
+                    # Apply per-timestep normalization
+                    batch_size, timesteps, action_dim = batch[key].shape
+                    for t in range(timesteps):
+                        if t < mean.shape[0]:
+                            batch[key][:, t, :] = (batch[key][:, t, :] - mean[t]) / (std[t] + 1e-8)
+                        else:
+                            # Fallback to last timestep
+                            batch[key][:, t, :] = (batch[key][:, t, :] - mean[-1]) / (std[-1] + 1e-8)
+                else:
+                    # Original global normalization
+                    batch[key] = (batch[key] - mean) / (std + 1e-8)
+                    
+        return batch
+
+class Unnormalize(nn.Module):
+    """Drop-in replacement with per-timestep action unnormalization"""
+    
+    def __init__(self, features, norm_map, stats=None):
+        super().__init__()
+        self.features = features
+        self.norm_map = norm_map  
+        self.stats = stats
+        
+        stats_buffers = create_stats_buffers(features, norm_map, stats,
+                                           per_timestep_action_norm=True)
+        for key, buffer in stats_buffers.items():
+            setattr(self, "buffer_" + key.replace(".", "_"), buffer)
+    
+    @torch.no_grad
+    def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        batch = dict(batch)
+        
+        for key, ft in self.features.items():
+            if key not in batch:
+                continue
+                
+            norm_mode = self.norm_map.get(ft.type, NormalizationMode.IDENTITY)
+            if norm_mode == NormalizationMode.IDENTITY:
+                continue
+                
+            buffer = getattr(self, "buffer_" + key.replace(".", "_"))
+            
+            if norm_mode == NormalizationMode.MEAN_STD:
+                mean = buffer["mean"]
+                std = buffer["std"]
+                
+                # NEW: Per-timestep unnormalization for actions  
+                if (ft.type == FeatureType.ACTION and 
+                    len(mean.shape) > len(ft.shape) and
+                    batch[key].ndim == 3):
+                    
+                    batch_size, timesteps, action_dim = batch[key].shape
+                    for t in range(timesteps):
+                        if t < mean.shape[0]:
+                            batch[key][:, t, :] = batch[key][:, t, :] * std[t] + mean[t]
+                        else:
+                            batch[key][:, t, :] = batch[key][:, t, :] * std[-1] + mean[-1]
+                else:
+                    # Original global unnormalization
+                    batch[key] = batch[key] * std + mean
+                    
+        return batch
+```
+
+### 2. Statistics Computation Script
+
+```python
+#!/usr/bin/env python
+# scripts/compute_per_timestep_stats.py
+
+import argparse
+import numpy as np
+import torch
+from pathlib import Path
+from tqdm import tqdm
+from lerobot.common.datasets.factory import make_dataset
+from lerobot.configs.types import FeatureType
+
+def compute_per_timestep_action_stats(dataset, action_key="action", max_timesteps=None):
+    """Compute per-timestep statistics for action trajectories."""
+    print(f"Computing per-timestep statistics for {action_key}...")
+    
+    # Collect all action trajectories
+    all_actions = []
+    for i in tqdm(range(len(dataset)), desc="Loading action trajectories"):
+        sample = dataset[i]
+        if action_key in sample:
+            action = sample[action_key]
+            if isinstance(action, torch.Tensor):
+                action = action.numpy()
+            all_actions.append(action)
+    
+    if not all_actions:
+        raise ValueError(f"No {action_key} found in dataset")
+    
+    # Stack into [num_samples, timesteps, action_dim]
+    actions = np.stack(all_actions, axis=0)
+    print(f"Action shape: {actions.shape}")
+    
+    num_samples, timesteps, action_dim = actions.shape
+    
+    # Limit timesteps if specified
+    if max_timesteps and timesteps > max_timesteps:
+        actions = actions[:, :max_timesteps, :]
+        timesteps = max_timesteps
+    
+    # Compute per-timestep statistics
+    per_timestep_mean = np.zeros((timesteps, action_dim))
+    per_timestep_std = np.zeros((timesteps, action_dim))
+    
+    for t in tqdm(range(timesteps), desc="Computing timestep stats"):
+        timestep_actions = actions[:, t, :]
+        per_timestep_mean[t] = np.mean(timestep_actions, axis=0)
+        per_timestep_std[t] = np.std(timestep_actions, axis=0)
+    
+    # Also compute global stats for comparison
+    global_mean = np.mean(actions.reshape(-1, action_dim), axis=0)
+    global_std = np.std(actions.reshape(-1, action_dim), axis=0)
+    
+    print(f"Per-timestep mean shape: {per_timestep_mean.shape}")
+    print(f"Example differences (timestep 0 vs timestep {timesteps-1}):")
+    print(f"Mean difference: {np.mean(np.abs(per_timestep_mean[0] - per_timestep_mean[-1])):.4f}")
+    
+    return {
+        "per_timestep_mean": per_timestep_mean,
+        "per_timestep_std": per_timestep_std,
+        "global_mean": global_mean,
+        "global_std": global_std,
+    }
+
+def save_enhanced_dataset_stats(dataset, output_path, max_timesteps=None):
+    """Compute and save enhanced dataset statistics with per-timestep action normalization."""
+    original_stats = {}
+    
+    for key, feature in dataset.meta.features.items():
+        if feature.type == FeatureType.ACTION:
+            # Compute per-timestep stats for actions
+            action_stats = compute_per_timestep_action_stats(dataset, key, max_timesteps=max_timesteps)
+            original_stats[key] = {
+                "mean": action_stats["per_timestep_mean"],
+                "std": action_stats["per_timestep_std"]
+            }
+            print(f"✓ Enhanced {key} with per-timestep normalization")
+        else:
+            # Use original stats computation for non-action features
+            all_values = []
+            for i in tqdm(range(min(1000, len(dataset))), desc=f"Sampling {key}"):
+                sample = dataset[i]
+                if key in sample:
+                    value = sample[key]
+                    if isinstance(value, torch.Tensor):
+                        value = value.numpy()
+                    all_values.append(value)
+            
+            if all_values:
+                all_values = np.stack(all_values, axis=0)
+                if feature.type == FeatureType.VISUAL:
+                    if all_values.ndim == 4:
+                        mean = np.mean(all_values, axis=(0, 2, 3), keepdims=True)[0]
+                        std = np.std(all_values, axis=(0, 2, 3), keepdims=True)[0]
+                    else:
+                        mean = np.mean(all_values, axis=0)
+                        std = np.std(all_values, axis=0)
+                else:
+                    mean = np.mean(all_values, axis=0)
+                    std = np.std(all_values, axis=0)
+                
+                original_stats[key] = {"mean": mean, "std": std}
+    
+    # Save enhanced stats
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    np.savez(output_path, **{
+        f"{key}_{stat_type}": stat_value 
+        for key, stats in original_stats.items() 
+        for stat_type, stat_value in stats.items()
+    })
+    
+    print(f"✓ Enhanced dataset statistics saved to {output_path}")
+    return original_stats
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", required=True, help="Dataset repo_id or path")
+    parser.add_argument("--output", required=True, help="Output path for enhanced stats")
+    parser.add_argument("--max-timesteps", type=int, default=50)
+    args = parser.parse_args()
+    
+    dataset = make_dataset({"name": args.dataset, "split": "train"})
+    save_enhanced_dataset_stats(dataset, args.output, max_timesteps=args.max_timesteps)
+
+if __name__ == "__main__":
+    main()
+```
+
+### 3. Statistics Loading Utility
+
+```python
+#!/usr/bin/env python  
+# lerobot/common/utils/load_enhanced_stats.py
+
+import numpy as np
+import torch
+from pathlib import Path
+
+def load_enhanced_stats(stats_path):
+    """Load enhanced dataset statistics with per-timestep action normalization."""
+    stats_path = Path(stats_path)
+    if not stats_path.exists():
+        raise FileNotFoundError(f"Enhanced stats not found: {stats_path}")
+    
+    raw_stats = np.load(stats_path)
+    enhanced_stats = {}
+    
+    # Group by feature key
+    for key in raw_stats.files:
+        parts = key.split('_')
+        feature_key = '_'.join(parts[:-1])
+        stat_type = parts[-1]
+        
+        if feature_key not in enhanced_stats:
+            enhanced_stats[feature_key] = {}
+        
+        enhanced_stats[feature_key][stat_type] = torch.from_numpy(raw_stats[key])
+    
+    print(f"Loaded enhanced stats for: {list(enhanced_stats.keys())}")
+    
+    for key, stats in enhanced_stats.items():
+        if "mean" in stats and len(stats["mean"].shape) > 1:
+            print(f"{key}: Per-timestep stats shape {stats['mean'].shape}")
+        else:
+            print(f"{key}: Global stats shape {stats['mean'].shape if 'mean' in stats else 'N/A'}")
+    
+    return enhanced_stats
+```
+
+## Usage Workflow
+
+### Step 1: Compute Enhanced Stats
+```bash
+python scripts/compute_per_timestep_stats.py \
+    --dataset "your_dataset_repo_id" \
+    --output "enhanced_stats/smolvla_per_timestep_stats.npz" \
+    --max-timesteps 50
+```
+
+### Step 2: Update SmolVLA Import
+```python
+# In modeling_smolvla.py, change the import:
+from lerobot.common.policies.normalize_tedrake import (
+    Normalize,
+    Unnormalize,
+)
+```
+
+### Step 3: Load Enhanced Stats in Training
+```python
+from lerobot.common.utils.load_enhanced_stats import load_enhanced_stats
+
+enhanced_stats = load_enhanced_stats("enhanced_stats/smolvla_per_timestep_stats.npz")
+policy = SmolVLAPolicy(config=config, dataset_stats=enhanced_stats)
+```
+
+## Expected Impact
+Based on Tedrake's results, this should provide **20+ percentage point improvements** in SmolVLA's success rates, especially on:
+- Long-horizon manipulation tasks
+- Tasks requiring precise temporal coordination  
+- Recovery behaviors during execution
+
+The improvement might be even larger with SmolVLA's 50-step chunks due to greater statistical divergence across timesteps.
+
+## Key Benefits
+1. **Drop-in replacement** - No changes to policy or training code
+2. **Easy A/B testing** - Just change the import
+3. **Safe rollback** - Original code untouched
+4. **Significant performance gain** - 20+ percentage points improvement expected
+
+This represents one of the highest-impact changes possible for robotic manipulation policies, focusing on the often-overlooked but crucial data preprocessing step that Tedrake showed was 40x more important than architectural innovations.

@@ -21,11 +21,8 @@ from .robot import Robot
 
 
 def make_robot_from_config(config: RobotConfig) -> Robot:
-    if config.type == "koch_follower":
-        from .koch_follower import KochFollower
-
-        return KochFollower(config)
-    elif config.type == "so100_follower":
+    
+    if config.type == "so100_follower":
         from .so100_follower import SO100Follower
 
         return SO100Follower(config)
@@ -41,26 +38,12 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .lekiwi import LeKiwi
 
         return LeKiwi(config)
-    elif config.type == "stretch3":
-        from .stretch3 import Stretch3Robot
-
-        return Stretch3Robot(config)
-    elif config.type == "viperx":
-        from .viperx import ViperX
-
-        return ViperX(config)
-    elif config.type == "hope_jr_hand":
-        from .hope_jr import HopeJrHand
-
-        return HopeJrHand(config)
-    elif config.type == "hope_jr_arm":
-        from .hope_jr import HopeJrArm
-
-        return HopeJrArm(config)
+    
     elif config.type == "bi_so100_follower":
         from .bi_so100_follower import BiSO100Follower
 
         return BiSO100Follower(config)
+    
     elif config.type == "mock_robot":
         from tests.mocks.mock_robot import MockRobot
 
